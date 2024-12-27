@@ -2,14 +2,23 @@
 name = "ml-prefetcher"
 version = "0.1.0"
 edition = "2021"
+authors = ["Ronan Takizawa"]
+description = "A machine learning based prefetcher for predicting access patterns"
+license = "MIT"
+repository = "https://github.com/ronantakizawa/rustmlprefetch"
+keywords = ["prefetch", "memory", "ml", "optimization", "pattern-matching"]
+categories = ["caching", "algorithms"]
 
 [dependencies]
 rand = "0.8.5"
 
 [dev-dependencies]
 criterion = "0.5"
-rand = "0.8.5"
 
 [[bench]]
 name = "prefetcher_benchmark"
 harness = false
+
+[lib]
+name = "ml_prefetcher"
+path = "src/lib.rs"
