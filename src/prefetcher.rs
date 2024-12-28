@@ -1,9 +1,8 @@
-
 use std::collections::{HashMap, VecDeque};
-use rand::Rng;
+use tokio::sync::mpsc;
 
-#[derive(Debug, Clone, PartialEq)]
-enum PatternType {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PatternType {
     Sequential,
     Strided,
     Repeated,
@@ -11,359 +10,221 @@ enum PatternType {
 }
 
 #[derive(Clone, Debug)]
-struct AccessPattern {
-    last_n_addresses: VecDeque<usize>,
+pub struct AccessPattern {
+    pattern_type: PatternType,
     stride: i32,
     frequency: u32,
     confidence: f64,
-    pattern_type: PatternType,
-    repeating_length: usize,
+    window_size: usize,
 }
 
 #[derive(Debug)]
-struct Perceptron {
-    weights: Vec<f64>,
-    learning_rate: f64,
-    threshold: f64,
+pub struct PredictionBatch {
+    pub address: i32,
+    pub predictions: Vec<i32>,
+    pub pattern_type: PatternType,
+    pub confidence: f64,
 }
 
-impl Perceptron {
-    fn new(feature_count: usize) -> Self {
-        let mut rng = rand::thread_rng();
-        Perceptron {
-            weights: (0..feature_count).map(|_| rng.gen_range(-0.5..0.5)).collect(),
-            learning_rate: 0.2,  // Increased learning rate
-            threshold: -0.2,     // Start with lower threshold to encourage predictions
-        }
-    }
-
-    fn predict(&self, features: &[f64]) -> (bool, f64) {
-        let sum: f64 = features.iter()
-            .zip(self.weights.iter())
-            .map(|(x, w)| x * w)
-            .sum();
-        (sum > self.threshold, sum)
-    }
-
-    fn train(&mut self, features: &[f64], label: bool) {
-        let (prediction, _) = self.predict(features);
-        if prediction != label {
-            let update = if label { self.learning_rate } else { -self.learning_rate };
-            for (w, x) in self.weights.iter_mut().zip(features.iter()) {
-                *w += update * x;
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct PredictivePrefetcher {
-    history: VecDeque<usize>,
-    pattern_table: HashMap<usize, AccessPattern>,
-    model: Perceptron,
+    history: VecDeque<i32>,
+    pattern_table: HashMap<i32, AccessPattern>,
     history_size: usize,
-    prefetch_queue: VecDeque<(usize, f64)>,
     hits: u32,
     misses: u32,
-    last_predictions: Vec<usize>,
+    prediction_tx: Option<mpsc::Sender<PredictionBatch>>,
     min_confidence: f64,
-    training_phase: bool,
+    max_window_size: usize,
 }
 
-impl PredictivePrefetcher {
-    pub fn new(history_size: usize) -> Self {
-        PredictivePrefetcher {
-            history: VecDeque::with_capacity(history_size),
-            pattern_table: HashMap::new(),
-            model: Perceptron::new(history_size + 4),
-            history_size,
-            prefetch_queue: VecDeque::new(),
-            hits: 0,
-            misses: 0,
-            last_predictions: Vec::new(),
-            min_confidence: -0.3,  // Lower initial confidence threshold
-            training_phase: true,
+impl AccessPattern {
+    fn new(pattern_type: PatternType, stride: i32, min_confidence: f64) -> Self {
+        AccessPattern {
+            pattern_type,
+            stride,
+            frequency: 1,
+            confidence: min_confidence,
+            window_size: 2,
         }
     }
 
-    fn detect_repeating_pattern(&self) -> usize {
-        if self.history.len() < 3 {
-            return 0;
-        }
-
-        // Look at last 6 accesses maximum
-        let recent: Vec<_> = self.history.iter().rev().take(6).collect();
-
-        // Try pattern lengths from 2 to 3
-        for len in 2..=3 {
-            if recent.len() < len * 2 {
-                continue;
-            }
-
-            // Get candidate pattern and previous sequence
-            let pattern = &recent[0..len];
-            let previous = &recent[len..len*2];
-            
-            // Check if pattern matches previous sequence
-            if pattern.iter().zip(previous.iter()).all(|(a, b)| a == b) {
-                // Quick check to ensure it's not just the same number repeated
-                if pattern.iter().zip(pattern.iter().skip(1)).any(|(a, b)| a != b) {
-                    return len;
-                }
-            }
-        }
-        
-        0
-    }
-
-    fn detect_pattern_type(&self) -> PatternType {
-        if self.history.len() < 3 {
-            return PatternType::Unknown;
-        }
-
-        // Check for repeating patterns first
-        if self.detect_repeating_pattern() > 0 {
-            return PatternType::Repeated;
-        }
-
-        // Get the last few differences
-        // Convert to Vec of differences
-        let diffs: Vec<i64> = self.history
-            .iter()
-            .zip(self.history.iter().skip(1))
-            .map(|(a, b)| *b as i64 - *a as i64)
-            .collect();
-
-        if diffs.len() >= 2 && diffs.windows(2).all(|w| w[0] == w[1]) {
-            if diffs[0].abs() == 1 {
-                PatternType::Sequential
-            } else {
-                PatternType::Strided
+    fn update(&mut self, was_hit: bool, max_window_size: usize) {
+        self.frequency += 1;
+        if was_hit {
+            self.confidence = (self.confidence * 0.8) + 0.2;
+            if self.window_size < max_window_size && self.confidence > 0.5 {
+                self.window_size += 1;
             }
         } else {
-            PatternType::Unknown
-        }
-    }
-
-    fn extract_features(history_size: usize, pattern: &AccessPattern) -> Vec<f64> {
-        let mut features = Vec::with_capacity(history_size + 4);
-        
-        // Normalize addresses relative to the first address
-        if let Some(&base) = pattern.last_n_addresses.front() {
-            for &addr in &pattern.last_n_addresses {
-                features.push((addr as i32 - base as i32) as f64 / 10.0);
+            self.confidence *= 0.8;
+            if self.window_size > 2 {
+                self.window_size -= 1;
             }
         }
-        
-        // Add pattern characteristics
-        features.push(pattern.stride as f64 / 10.0);
-        features.push((pattern.frequency as f64).min(10.0) / 10.0);
-        features.push(pattern.confidence);
-        
-        // Pattern type as feature
-        features.push(match pattern.pattern_type {
-            PatternType::Sequential => 1.0,
-            PatternType::Strided => 0.7,
-            PatternType::Repeated => 0.5,
-            PatternType::Unknown => 0.0,
-        });
-        
-        features
     }
 
-    fn create_pattern(&self, address: usize) -> AccessPattern {
-        let mut pattern = AccessPattern {
-            last_n_addresses: self.history.clone(),
-            stride: 0,
-            frequency: 1,
-            confidence: 0.0,
-            pattern_type: PatternType::Unknown,
-            repeating_length: 0,
-        };
-
-        if self.history.len() >= 2 {
-            let last_addr = self.history[self.history.len() - 2];
-            pattern.stride = (address as i64 - last_addr as i64)
-                .max(i32::MIN as i64)
-                .min(i32::MAX as i64) as i32;
-        }
-
-        pattern.pattern_type = self.detect_pattern_type();
-        pattern.repeating_length = self.detect_repeating_pattern();
-        pattern
-    }
-
-    fn predict_next_addresses(&self, current: usize, pattern: &AccessPattern) -> Vec<usize> {
+    fn generate_predictions(&self, address: i32, history: &VecDeque<i32>) -> Vec<i32> {
         let mut predictions = Vec::new();
         
-        match pattern.pattern_type {
-            PatternType::Repeated => {
-                // For repeated patterns, look at the last occurrence of the pattern
-                // and predict the next few values that followed it
-                if pattern.repeating_length > 0 {
-                    let pattern_len = pattern.repeating_length;
-                    let history_vec: Vec<_> = self.history.iter().copied().collect();
-                    
-                    // Find the position in the current pattern
-                    let mut pos_in_pattern = 0;
-                    for i in 1..=pattern_len {
-                        if i <= history_vec.len() 
-                           && current == history_vec[history_vec.len() - i] {
-                            pos_in_pattern = i;
-                            break;
-                        }
+        if self.confidence >= 0.2 {
+            match self.pattern_type {
+                PatternType::Sequential => {
+                    for i in 1..=self.window_size {
+                        predictions.push(address + i as i32);
                     }
-                    
-                    // If we found our position, predict the next values
-                    if pos_in_pattern > 0 {
-                        for i in 1..=2 {  // Predict up to 2 next values
-                            let predict_idx = history_vec.len() - pos_in_pattern - pattern_len + i;
-                            if predict_idx < history_vec.len() {
-                                predictions.push(history_vec[predict_idx]);
-                            }
-                        }
+                },
+                PatternType::Strided => {
+                    let mut next = address;
+                    for _ in 0..self.window_size {
+                        next += self.stride;
+                        predictions.push(next);
                     }
-                }
-            },
-            PatternType::Sequential | PatternType::Strided => {
-                if pattern.stride != 0 {
-                    // First prediction
-                    if let Some(next) = if pattern.stride > 0 {
-                        current.checked_add(pattern.stride as usize)
-                    } else {
-                        current.checked_sub(pattern.stride.unsigned_abs() as usize)
-                    } {
-                        if next < usize::MAX / 2 {
-                            predictions.push(next);
-                            
-                            // Second prediction
-                            if let Some(next_next) = if pattern.stride > 0 {
-                                next.checked_add(pattern.stride as usize)
-                            } else {
-                                next.checked_sub(pattern.stride.unsigned_abs() as usize)
-                            } {
-                                if next_next < usize::MAX / 2 {
-                                    predictions.push(next_next);
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            PatternType::Unknown => {
-                // For unknown patterns, try simple stride prediction if we have consistent recent behavior
-                if self.history.len() >= 2 {
-                    let last = self.history[self.history.len() - 1];
-                    let prev = self.history[self.history.len() - 2];
-                    let stride = (last as i64 - prev as i64) as i32;
-                    
-                    if stride != 0 {
-                        if let Some(next) = current.checked_add(stride.unsigned_abs() as usize) {
-                            if next < usize::MAX / 2 {
+                },
+                PatternType::Repeated => {
+                    if let Some(cycle_start) = history.len().checked_sub(self.stride as usize) {
+                        for i in 0..self.window_size {
+                            if let Some(&next) = history.get(cycle_start + i) {
                                 predictions.push(next);
                             }
                         }
                     }
+                },
+                PatternType::Unknown => {
+                    predictions.push(address + 1);
                 }
             }
         }
         
         predictions
     }
+}
 
-    pub fn access(&mut self, address: usize) -> Vec<usize> {
+impl PredictivePrefetcher {
+    pub fn new(history_size: usize) -> Self {
+        Self::with_config(history_size, 0.2, 4)
+    }
+
+    pub fn with_config(history_size: usize, min_confidence: f64, max_window_size: usize) -> Self {
+        PredictivePrefetcher {
+            history: VecDeque::with_capacity(history_size),
+            pattern_table: HashMap::new(),
+            history_size,
+            hits: 0,
+            misses: 0,
+            prediction_tx: None,
+            min_confidence,
+            max_window_size,
+        }
+    }
+
+    pub async fn start_async_predictor(&mut self) -> mpsc::Receiver<PredictionBatch> {
+        let (tx, rx) = mpsc::channel(100);
+        self.prediction_tx = Some(tx);
+        rx
+    }
+
+    fn detect_pattern(&self) -> (PatternType, i32) {
+        if self.history.len() < 2 {
+            return (PatternType::Unknown, 0);
+        }
+
+        let vec: Vec<_> = self.history.iter().copied().collect();
+        
+        // Sequential pattern detection
+        let mut sequential_matches = 0;
+        for i in 1..vec.len() {
+            if vec[i] == vec[i - 1] + 1 {
+                sequential_matches += 1;
+            }
+        }
+        if sequential_matches >= (vec.len() - 1) / 2 {
+            return (PatternType::Sequential, 1);
+        }
+
+        // Strided pattern detection
+        let mut stride_matches = HashMap::new();
+        for i in 1..vec.len() {
+            let stride = vec[i] - vec[i - 1];
+            *stride_matches.entry(stride).or_insert(0) += 1;
+        }
+
+        if let Some((&stride, &count)) = stride_matches.iter().max_by_key(|&(_, count)| count) {
+            if count >= (vec.len() - 1) / 2 && stride != 0 {
+                return (PatternType::Strided, stride);
+            }
+        }
+
+        // Repeated pattern detection
+        if vec.len() >= 3 {
+            for len in 2..=vec.len()/2 {
+                let mut matches = 0;
+                let mut possible = 0;
+                for i in 0..vec.len() - len {
+                    if vec[i] == vec[i + len] {
+                        matches += 1;
+                    }
+                    possible += 1;
+                }
+                if possible > 0 && matches as f64 / possible as f64 > 0.5 {
+                    return (PatternType::Repeated, len as i32);
+                }
+            }
+        }
+
+        (PatternType::Unknown, 0)
+    }
+
+    pub async fn access(&mut self, address: i32) -> Vec<i32> {
+        // Check if current access was predicted
+        let was_hit = if let Some(prev_addr) = self.history.back() {
+            if let Some(pattern) = self.pattern_table.get(prev_addr) {
+                let prev_predictions = pattern.generate_predictions(*prev_addr, &self.history);
+                prev_predictions.contains(&address)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Update hits/misses
+        if was_hit {
+            self.hits += 1;
+        } else if !self.pattern_table.is_empty() {
+            self.misses += 1;
+        }
+
+        // Update history
         self.history.push_back(address);
         if self.history.len() > self.history_size {
             self.history.pop_front();
-            self.training_phase = false;  // Exit training phase after filling history
         }
 
-        let mut pattern = if let Some(existing) = self.pattern_table.get(&address) {
-            let mut updated = existing.clone();
-            updated.frequency += 1;
-            updated.pattern_type = self.detect_pattern_type();
-            updated.repeating_length = self.detect_repeating_pattern();
-            updated
+        // Detect pattern and create new pattern
+        let (pattern_type, stride) = self.detect_pattern();
+        let new_pattern = AccessPattern::new(pattern_type.clone(), stride, self.min_confidence);
+        let predictions = new_pattern.generate_predictions(address, &self.history);
+
+        // Update pattern table
+        if let Some(pattern) = self.pattern_table.get_mut(&address) {
+            pattern.update(was_hit, self.max_window_size);
         } else {
-            self.create_pattern(address)
-        };
-
-        // Adjust confidence thresholds based on pattern type and training phase
-        // Adjust confidence thresholds based on pattern type and history
-        let base_confidence = if self.training_phase { -0.4 } else { -0.3 };
-        
-        self.min_confidence = match pattern.pattern_type {
-            PatternType::Sequential => base_confidence - 0.1,
-            PatternType::Strided => {
-                if pattern.frequency > 3 {
-                    base_confidence - 0.1  // More confident after seeing pattern multiple times
-                } else {
-                    base_confidence
-                }
-            },
-            PatternType::Repeated => {
-                if pattern.repeating_length > 0 && pattern.frequency > 2 {
-                    base_confidence - 0.2  // More confident for clear repetitions
-                } else {
-                    base_confidence
-                }
-            },
-            PatternType::Unknown => base_confidence + 0.2,  // More conservative for unknown patterns
-        };
-
-        let mut prefetch_addresses = Vec::new();
-
-        if self.history.len() >= 3 {  // Reduced minimum history requirement
-            let features = Self::extract_features(self.history_size, &pattern);
-            let (should_prefetch, confidence) = self.model.predict(&features);
-            
-            pattern.confidence = confidence;
-
-            if should_prefetch && confidence > self.min_confidence {
-                let predictions = self.predict_next_addresses(address, &pattern);
-                for &next_addr in &predictions {
-                    if !self.last_predictions.contains(&next_addr) {
-                        prefetch_addresses.push(next_addr);
-                        self.prefetch_queue.push_back((next_addr, confidence * 0.9));
-                        self.last_predictions.push(next_addr);
-                    }
-                }
-
-                // Keep last predictions list manageable
-                while self.last_predictions.len() > self.history_size * 2 {
-                    self.last_predictions.remove(0);
-                }
-            }
+            self.pattern_table.insert(address, new_pattern);
         }
 
-        // Clean up old predictions
-        while self.last_predictions.len() > self.history_size * 2 {
-            self.last_predictions.remove(0);
+        // Send async predictions if configured
+        if let Some(tx) = &self.prediction_tx {
+            let confidence = self.pattern_table.get(&address).map_or(0.0, |p| p.confidence);
+            let batch = PredictionBatch {
+                address,
+                predictions: predictions.clone(),
+                pattern_type,
+                confidence,
+            };
+            let _ = tx.send(batch).await;
         }
 
-        // Update learning based on prediction accuracy
-        if self.last_predictions.contains(&address) {
-            self.hits += 1;
-            pattern.confidence += 0.2;  // Increased confidence boost
-            pattern.confidence = pattern.confidence.min(1.0);
-            let features = Self::extract_features(self.history_size, &pattern);
-            self.model.train(&features, true);
-        } else if let Some((predicted, _)) = self.prefetch_queue.pop_front() {
-            if predicted != address {
-                self.misses += 1;
-                if let Some(pred_pattern) = self.pattern_table.get(&predicted).cloned() {
-                    let mut updated_pattern = pred_pattern;
-                    updated_pattern.confidence -= 0.1;
-                    updated_pattern.confidence = updated_pattern.confidence.max(-1.0);
-                    let features = Self::extract_features(self.history_size, &updated_pattern);
-                    self.model.train(&features, false);
-                    self.pattern_table.insert(predicted, updated_pattern);
-                }
-            }
-        }
-
-        self.pattern_table.insert(address, pattern);
-        prefetch_addresses
+        predictions
     }
 
     pub fn get_stats(&self) -> (u32, u32, f64) {
@@ -373,10 +234,5 @@ impl PredictivePrefetcher {
             0.0
         };
         (self.hits, self.misses, accuracy)
-    }
-    
-    #[cfg(test)]
-    pub fn get_history(&self) -> &VecDeque<usize> {
-        &self.history
     }
 }

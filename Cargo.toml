@@ -1,6 +1,6 @@
 [package]
 name = "ml-prefetcher"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Ronan Takizawa"]
 description = "A machine learning based prefetcher for predicting access patterns"
@@ -10,10 +10,15 @@ keywords = ["prefetch", "memory", "ml", "optimization", "pattern-matching"]
 categories = ["caching", "algorithms"]
 
 [dependencies]
+tokio = { version = "1.0", features = ["full"] }
+rayon = "1.7"
+num-traits = "0.2"
 rand = "0.8.5"
 
 [dev-dependencies]
-criterion = "0.5"
+tokio = { version = "1.0", features = ["full", "rt", "macros"] }
+criterion = "0.4"
+rand = "0.8"
 
 [[bench]]
 name = "prefetcher_benchmark"
@@ -22,3 +27,7 @@ harness = false
 [lib]
 name = "ml_prefetcher"
 path = "src/lib.rs"
+
+[[example]]
+name = "async_prefetch"
+path = "examples/async_prefetch.rs"
